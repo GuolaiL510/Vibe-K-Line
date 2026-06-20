@@ -6,7 +6,7 @@ let engine: MarketEngine | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   engine = new MarketEngine();
-  engine.start().catch(err => console.error('Code Market: failed to start engine', err));
+  engine.start().catch(err => console.error('Vibe K-Line: failed to start engine', err));
 
   const openCommand = vscode.commands.registerCommand('codeMarket.open', () => {
     if (!engine) {

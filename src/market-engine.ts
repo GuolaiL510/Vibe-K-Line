@@ -24,6 +24,15 @@ export interface FileStock {
   totalAdded: number;
   totalDeleted: number;
   candles: Candle[];
+  lifecycle: FileLifecycle;
+}
+
+export interface FileLifecycle {
+  highestLoc: number;
+  lowestLoc: number;
+  biggestPump: number;
+  biggestDrop: number;
+  listedDate: number;
 }
 
 export interface MarketSummary {
@@ -33,9 +42,29 @@ export interface MarketSummary {
   losers: number;
   unchanged: number;
   delisted: number;
+  ipoCount: number;
+  bullishCount: number;
+  bearishCount: number;
   vibeScore: number;
   vibeStatus: string;
 }
+
+export interface EditEvent {
+  timestamp: number;
+  uri: string;
+  name: string;
+  added: number;
+  removed: number;
+}
+
+export interface SectorInfo {
+  directory: string;
+  totalLines: number;
+  totalChange: number;
+  files: string[];
+}
+
+export type Timeframe = '10s' | '1m' | '5m' | 'day' | 'month' | 'quarter' | 'year';
 
 interface FileState {
   lines: number;
@@ -47,6 +76,17 @@ interface FileState {
 }
 
 const CANDLE_WINDOW_MS = 10000;
+const MAX_RECENT_EDITS = 100;
+
+const TIMEFRAME_MS: Record<Timeframe, number> = {
+  '10s': 10000,
+  '1m': 60000,
+  '5m': 300000,
+  'day': 86400000,
+  'month': 2592000000,
+  'quarter': 7776000000,
+  'year': 31536000000,
+};
 
 const IGNORED_PATTERNS = [
   /(^|[\\/])node_modules($|[\\/])/,
@@ -55,7 +95,7 @@ const IGNORED_PATTERNS = [
   /(^|[\\/])dist($|[\\/])/,
   /(^|[\\/])build($|[\\/])/,
   /(^|[\\/])out($|[\\/])/,
-  /\.(png|jpg|jpeg|gif|bmp|svg|ico|webp|mp3|mp4|wav|avi|mov|mkv|pdf|zip|tar|gz|rar|7z|exe|dll|so|dylib|bin|dat|ttf|otf|woff|woff2|eot)$/i
+  /\.(png|jpg|jpeg|gif|bmp|svg|ico|webp|mp3|mp4|wav|avi|mov|mkv|pdf|zip|tar|gz|rar|7z|exe|dll|so|dylib|bin|dat|ttf|otf|woff|woff2|eot|vsix)$/i
 ];
 
 function shouldIgnore(filePath: string): boolean {
@@ -83,6 +123,45 @@ function getRelativePath(uri: vscode.Uri): string {
   return path.relative(folder.uri.fsPath, uri.fsPath);
 }
 
+function getDirectory(uri: vscode.Uri): string {
+  const rel = getRelativePath(uri);
+  const dir = path.dirname(rel);
+  return dir === '.' ? '/' : dir;
+}
+
+function aggregateCandles(baseCandles: Candle[], timeframeMs: number): Candle[] {
+  if (baseCandles.length === 0) {
+    return [];
+  }
+  const result: Candle[] = [];
+  let current: Candle | null = null;
+  for (const c of baseCandles) {
+    const bucketStart = Math.floor(c.timestamp / timeframeMs) * timeframeMs;
+    if (!current || current.timestamp !== bucketStart) {
+      if (current) {
+        result.push(current);
+      }
+      current = {
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+        timestamp: bucketStart,
+      };
+    } else {
+      current.high = Math.max(current.high, c.high);
+      current.low = Math.min(current.low, c.low);
+      current.close = c.close;
+      current.volume += c.volume;
+    }
+  }
+  if (current) {
+    result.push(current);
+  }
+  return result;
+}
+
 export class MarketEngine implements vscode.Disposable {
   private files = new Map<string, FileState>();
   private stocks = new Map<string, FileStock>();
@@ -92,6 +171,7 @@ export class MarketEngine implements vscode.Disposable {
   private disposed = false;
   private storage = new Storage();
   private savePending = false;
+  private recentEdits: EditEvent[] = [];
 
   constructor() {
     this.interval = setInterval(() => this.flushCandles(), CANDLE_WINDOW_MS);
@@ -149,6 +229,86 @@ export class MarketEngine implements vscode.Disposable {
       .slice(0, 10);
   }
 
+  getRecentEdits(): EditEvent[] {
+    return this.recentEdits.slice();
+  }
+
+  getRecentEditsForFile(uri: string): EditEvent[] {
+    return this.recentEdits.filter(e => e.uri === uri);
+  }
+
+  getSectors(): SectorInfo[] {
+    const map = new Map<string, SectorInfo>();
+    for (const stock of this.getActiveStocks()) {
+      const dir = getDirectory(vscode.Uri.parse(stock.uri));
+      let sector = map.get(dir);
+      if (!sector) {
+        sector = { directory: dir, totalLines: 0, totalChange: 0, files: [] };
+        map.set(dir, sector);
+      }
+      sector.totalLines += stock.currentLines;
+      sector.totalChange += stock.change;
+      sector.files.push(stock.name);
+    }
+    return Array.from(map.values()).sort((a, b) => b.totalLines - a.totalLines);
+  }
+
+  getStock(uri: string): FileStock | undefined {
+    return this.stocks.get(uri);
+  }
+
+  getCandlesForTimeframe(stock: FileStock, timeframe: Timeframe): Candle[] {
+    if (timeframe === '10s') {
+      return stock.candles.slice();
+    }
+    return aggregateCandles(stock.candles, TIMEFRAME_MS[timeframe]);
+  }
+
+  getMarketCandles(timeframe: Timeframe): Candle[] {
+    const active = this.getActiveStocks();
+    if (active.length === 0) {
+      return [];
+    }
+    const allTimestamps = new Set<number>();
+    const stockCandles = new Map<string, Candle[]>();
+    for (const stock of active) {
+      const candles = this.getCandlesForTimeframe(stock, timeframe);
+      stockCandles.set(stock.uri, candles);
+      for (const c of candles) {
+        allTimestamps.add(c.timestamp);
+      }
+    }
+    const timestamps = Array.from(allTimestamps).sort((a, b) => a - b);
+    if (timestamps.length === 0) {
+      return [];
+    }
+    const result: Candle[] = [];
+    for (const ts of timestamps) {
+      let open = 0;
+      let high = 0;
+      let low = 0;
+      let close = 0;
+      let volume = 0;
+      let count = 0;
+      for (const stock of active) {
+        const candles = stockCandles.get(stock.uri)!;
+        const c = candles.find(x => x.timestamp === ts);
+        if (c) {
+          open += c.open;
+          high += c.high;
+          low += c.low;
+          close += c.close;
+          volume += c.volume;
+          count++;
+        }
+      }
+      if (count > 0) {
+        result.push({ open, high, low, close, volume, timestamp: ts });
+      }
+    }
+    return result;
+  }
+
   getMarketSummary(): MarketSummary {
     const stocks = this.getStocks();
     const active = stocks.filter(s => s.status === 'active');
@@ -159,12 +319,14 @@ export class MarketEngine implements vscode.Disposable {
     const gainers = active.filter(s => s.changePercent > 0).length;
     const losers = active.filter(s => s.changePercent < 0).length;
     const unchanged = active.length - gainers - losers;
-    const newFiles = active.filter(s => s.candles.length <= 1).length;
+    const ipoCount = active.filter(s => s.candles.length <= 1).length;
+    const bullishCount = active.filter(s => this.getTag(s) === '🔴 Bullish' || this.getTag(s) === '🚀 Mooning').length;
+    const bearishCount = active.filter(s => this.getTag(s) === '🟢 Bearish' || this.getTag(s) === '🔻 Rugged').length;
 
     const added = active.reduce((sum, s) => sum + s.totalAdded, 0);
     const deleted = active.reduce((sum, s) => sum + s.totalDeleted, 0);
     const editedFiles = active.filter(s => s.totalAdded + s.totalDeleted > 0).length;
-    const vibeScore = Math.round(added * 1.0 + deleted * 0.6 + editedFiles * 3 + newFiles * 10 - delisted.length * 5);
+    const vibeScore = Math.round(added * 1.0 + deleted * 0.6 + editedFiles * 3 + ipoCount * 10 - delisted.length * 5);
 
     let vibeStatus = '⚖️ Stable';
     if (vibeScore > 500) { vibeStatus = '🔥 Extremely Bullish Vibe'; }
@@ -173,7 +335,7 @@ export class MarketEngine implements vscode.Disposable {
     else if (vibeScore < -300) { vibeStatus = '💥 Market Crash'; }
     else if (vibeScore < -100) { vibeStatus = '📉 Bearish Vibe'; }
 
-    return { totalLines, totalVolume, gainers, losers, unchanged, delisted: delisted.length, vibeScore, vibeStatus };
+    return { totalLines, totalVolume, gainers, losers, unchanged, delisted: delisted.length, ipoCount, bullishCount, bearishCount, vibeScore, vibeStatus };
   }
 
   getTag(stock: FileStock): string {
@@ -232,7 +394,7 @@ export class MarketEngine implements vscode.Disposable {
         }
       }
     } catch (err) {
-      console.error(`Code Market: failed to scan ${uri.fsPath}`, err);
+      console.error(`Vibe K-Line: failed to scan ${uri.fsPath}`, err);
     }
   }
 
@@ -240,7 +402,6 @@ export class MarketEngine implements vscode.Disposable {
     const key = uri.toString();
 
     if (this.files.has(key)) {
-      // Existing stock from persistent storage: refresh current line count.
       try {
         const content = await vscode.workspace.fs.readFile(uri);
         const lines = countLines(new TextDecoder().decode(content));
@@ -257,8 +418,9 @@ export class MarketEngine implements vscode.Disposable {
         stock.status = 'active';
         stock.delistedAt = undefined;
         this.recalcChange(stock);
+        this.updateLifecycle(stock);
       } catch (err) {
-        console.error(`Code Market: failed to reload ${uri.fsPath}`, err);
+        console.error(`Vibe K-Line: failed to reload ${uri.fsPath}`, err);
       }
       return;
     }
@@ -268,12 +430,21 @@ export class MarketEngine implements vscode.Disposable {
       const lines = countLines(new TextDecoder().decode(content));
       this.ipo(key, path.basename(uri.fsPath), lines);
     } catch (err) {
-      console.error(`Code Market: failed to load ${uri.fsPath}`, err);
+      console.error(`Vibe K-Line: failed to load ${uri.fsPath}`, err);
     }
   }
 
   private hydratePersisted(persisted: Map<string, FileStock>): void {
     for (const [uri, stock] of persisted.entries()) {
+      if (!stock.lifecycle) {
+        stock.lifecycle = {
+          highestLoc: stock.currentLines,
+          lowestLoc: stock.currentLines,
+          biggestPump: 0,
+          biggestDrop: 0,
+          listedDate: stock.ipoDate,
+        };
+      }
       this.stocks.set(uri, stock);
       const lastClose = stock.candles.length > 0 ? stock.candles[stock.candles.length - 1].close : stock.currentLines;
       this.files.set(uri, {
@@ -288,6 +459,7 @@ export class MarketEngine implements vscode.Disposable {
   }
 
   private ipo(uri: string, name: string, lines: number): void {
+    const now = Date.now();
     this.files.set(uri, {
       lines,
       candleStartLines: lines,
@@ -305,11 +477,33 @@ export class MarketEngine implements vscode.Disposable {
       change: 0,
       changePercent: 0,
       status: 'active',
-      ipoDate: Date.now(),
+      ipoDate: now,
       totalAdded: 0,
       totalDeleted: 0,
       candles: [],
+      lifecycle: {
+        highestLoc: lines,
+        lowestLoc: lines,
+        biggestPump: 0,
+        biggestDrop: 0,
+        listedDate: now,
+      },
     });
+  }
+
+  private updateLifecycle(stock: FileStock): void {
+    const lc = stock.lifecycle;
+    lc.highestLoc = Math.max(lc.highestLoc, stock.currentLines);
+    lc.lowestLoc = Math.min(lc.lowestLoc, stock.currentLines);
+    if (stock.candles.length > 0) {
+      const last = stock.candles[stock.candles.length - 1];
+      const change = last.close - last.open;
+      if (change > 0) {
+        lc.biggestPump = Math.max(lc.biggestPump, change);
+      } else if (change < 0) {
+        lc.biggestDrop = Math.max(lc.biggestDrop, -change);
+      }
+    }
   }
 
   private setupWatchers(): void {
@@ -344,11 +538,6 @@ export class MarketEngine implements vscode.Disposable {
     if (shouldIgnore(getRelativePath(uri))) {
       return;
     }
-    const key = uri.toString();
-    if (this.files.has(key)) {
-      // Already tracked by the live text-document listener; skip to avoid double counting.
-      return;
-    }
     await this.loadFile(uri);
     this.emit();
     this.scheduleSave();
@@ -361,6 +550,7 @@ export class MarketEngine implements vscode.Disposable {
       stock.status = 'delisted';
       stock.delistedAt = Date.now();
     }
+    this.files.delete(key);
     this.emit();
     this.scheduleSave();
   }
@@ -402,6 +592,19 @@ export class MarketEngine implements vscode.Disposable {
     stock.totalAdded += added;
     stock.totalDeleted += removed;
     this.recalcChange(stock);
+    this.updateLifecycle(stock);
+
+    this.recentEdits.push({
+      timestamp: Date.now(),
+      uri: key,
+      name: stock.name,
+      added,
+      removed,
+    });
+    if (this.recentEdits.length > MAX_RECENT_EDITS) {
+      this.recentEdits.shift();
+    }
+
     this.emit();
     this.scheduleSave();
   }
@@ -433,6 +636,8 @@ export class MarketEngine implements vscode.Disposable {
         stock.candles.shift();
       }
 
+      this.updateLifecycle(stock);
+
       stock.previousClose = state.lines;
       this.recalcChange(stock);
 
@@ -459,7 +664,7 @@ export class MarketEngine implements vscode.Disposable {
       try {
         await this.storage.saveAll(this.stocks);
       } catch (err) {
-        console.error('Code Market: failed to save market data', err);
+        console.error('Vibe K-Line: failed to save market data', err);
       }
     }, 100);
   }

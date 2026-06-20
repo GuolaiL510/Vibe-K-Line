@@ -4,6 +4,7 @@ dist
 build
 images
 .code-market
+*.vsix
 *.png
 *.jpg
 *.jpeg

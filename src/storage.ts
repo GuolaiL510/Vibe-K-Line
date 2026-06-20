@@ -19,6 +19,13 @@ interface PersistedStock {
   totalAdded: number;
   totalDeleted: number;
   candles: PersistedCandle[];
+  lifecycle?: {
+    highestLoc: number;
+    lowestLoc: number;
+    biggestPump: number;
+    biggestDrop: number;
+    listedDate: number;
+  };
 }
 
 interface PersistedData {
@@ -121,6 +128,7 @@ export class Storage {
         volume: c.volume,
         timestamp: c.timestamp,
       })),
+      lifecycle: stock.lifecycle,
     };
   }
 
@@ -153,6 +161,13 @@ export class Storage {
       totalAdded: data.totalAdded || 0,
       totalDeleted: data.totalDeleted || 0,
       candles,
+      lifecycle: data.lifecycle || {
+        highestLoc: currentLines,
+        lowestLoc: currentLines,
+        biggestPump: 0,
+        biggestDrop: 0,
+        listedDate: data.ipoDate || Date.now(),
+      },
     };
   }
 }

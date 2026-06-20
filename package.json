@@ -1,9 +1,9 @@
 {
-  "name": "code-market",
-  "displayName": "Code Market",
-  "description": "Real-time code activity visualized as a stock market with K-line charts",
+  "name": "vibe-k-line",
+  "displayName": "Vibe K-Line",
+  "description": "Turn your vibe coding session into a stock market. Every file is a stock, every edit is a trade.",
   "version": "0.1.0",
-  "publisher": "code-market",
+  "publisher": "vibe-k-line",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -18,7 +18,7 @@
     "commands": [
       {
         "command": "codeMarket.open",
-        "title": "Code Market: Open"
+        "title": "Vibe K-Line: Open"
       }
     ]
   },
@@ -28,8 +28,8 @@
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
-    "@types/vscode": "^1.74.0",
     "@types/node": "18.x",
+    "@types/vscode": "^1.74.0",
     "typescript": "^5.0.0"
   }
 }
