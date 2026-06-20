@@ -2,6 +2,7 @@
 !dist/**
 **/.git/**
 **/.vscode/**
+**/.code-market/**
 node_modules/**
 images/**
 *.png
